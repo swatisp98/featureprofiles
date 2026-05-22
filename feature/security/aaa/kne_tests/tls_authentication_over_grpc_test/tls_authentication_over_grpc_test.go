@@ -16,24 +16,55 @@ package tls_authentication_over_grpc_test
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/openconfig/featureprofiles/internal/deviations"
 	"github.com/openconfig/featureprofiles/internal/fptest"
+	"github.com/openconfig/featureprofiles/internal/helpers"
 	"github.com/openconfig/featureprofiles/internal/security/credz"
 	"github.com/openconfig/ondatra"
+	"github.com/openconfig/ondatra/binding"
 	"github.com/openconfig/ondatra/gnmi"
 	"github.com/openconfig/ondatra/gnmi/oc"
 	"github.com/openconfig/ygot/ygot"
+	"golang.org/x/crypto/ssh"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 
 	gpb "github.com/openconfig/gnmi/proto/gnmi"
+	tpb "github.com/openconfig/kne/proto/topo"
 )
 
 func TestMain(m *testing.M) {
 	fptest.RunTests(m)
+}
+
+func keyboardInteraction(password string) ssh.KeyboardInteractiveChallenge {
+	return func(user, instruction string, questions []string, echos []bool) ([]string, error) {
+		if len(questions) == 0 {
+			return []string{}, nil
+		}
+		return []string{password}, nil
+	}
+}
+
+func gnmiClient(dut *ondatra.DUTDevice, gnmiAddr string) (gpb.GNMIClient, error) {
+	conn, err := grpc.Dial(
+		gnmiAddr,
+		grpc.WithTransportCredentials(
+			credentials.NewTLS(&tls.Config{
+				InsecureSkipVerify: true, // NOLINT
+			})),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("grpc.Dial => unexpected failure dialing GNMI (should not require auth): %w", err)
+	}
+	return gpb.NewGNMIClient(conn), nil
 }
 
 // helper function for native model;
@@ -130,6 +161,36 @@ func createNativeUser(t testing.TB, dut *ondatra.DUTDevice, user string, pass st
 		if _, err := gnmiClient.Set(context.Background(), SetRequest); err != nil {
 			t.Fatalf("Unexpected error configuring User: %v", err)
 		}
+	case ondatra.JUNIPER:
+		cliConfig := fmt.Sprintf(`
+system {
+    login {
+        user %s {
+            class %s;
+            authentication {
+                plain-text-password-value "%s";
+            }
+        }
+    }
+}`, user, role, pass)
+		SetRequest := &gpb.SetRequest{
+			Update: []*gpb.Update{
+				{
+					Path: &gpb.Path{
+						Origin: "cli",
+					},
+					Val: &gpb.TypedValue{
+						Value: &gpb.TypedValue_AsciiVal{
+							AsciiVal: cliConfig,
+						},
+					},
+				},
+			},
+		}
+		gnmiClient := dut.RawAPIs().GNMI(t)
+		if _, err := gnmiClient.Set(context.Background(), SetRequest); err != nil {
+			t.Fatalf("Unexpected error configuring Juniper user: %v", err)
+		}
 	default:
 		t.Fatalf("Unsupported vendor %s for deviation 'deviation_native_users'", dut.Vendor())
 	}
@@ -137,13 +198,49 @@ func createNativeUser(t testing.TB, dut *ondatra.DUTDevice, user string, pass st
 
 func TestAuthentication(t *testing.T) {
 	dut := ondatra.DUT(t, "dut")
+	var servDUT interface {
+		Service(string) (*tpb.Service, error)
+	}
+	if err := binding.DUTAs(dut.RawAPIs().BindingDUT(), &servDUT); err != nil {
+		t.Fatalf("DUT does not support Service function: %v", err)
+	}
+	sshService, err := servDUT.Service("ssh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshAddr := fmt.Sprintf("%s:%d", sshService.GetOutsideIp(), sshService.GetOutside())
+	gnmiService, err := servDUT.Service("gnmi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately try to reach gnmi via the DUT (SSH) IP.
+	gnmiAddr := fmt.Sprintf("%s:%d", sshService.GetOutsideIp(), gnmiService.GetOutside())
+
+	switch dut.Vendor() {
+	case ondatra.ARISTA:
+		t.Logf("Arista vendor, performing SSH cleanup")
+		cliConfig := `
+				management ssh
+					authentication protocol password
+				`
+		helpers.GnmiCLIConfig(t, dut, cliConfig)
+	default:
+		t.Logf("No CLI config required for vendor %s", dut.Vendor())
+	}
 	if deviations.SetNativeUser(dut) {
-		createNativeUser(t, dut, "alice", "password", "admin")
+		role := "admin"
+		if dut.Vendor() == ondatra.JUNIPER {
+			role = "super-user"
+			// Wait for gNMI service to be ready after config push.
+			t.Log("Waiting for gNMI service to be ready on Juniper DUT...")
+			time.Sleep(30 * time.Second)
+		}
+		createNativeUser(t, dut, "alice", "Password1", role)
 	} else {
 		gnmi.Replace(t, dut, gnmi.OC().System().Aaa().Authentication().
 			User("alice").Config(), &oc.System_Aaa_Authentication_User{
 			Username: ygot.String("alice"),
-			Password: ygot.String("password"),
+			Password: ygot.String("Password1"),
 			Role:     oc.AaaTypes_SYSTEM_DEFINED_ROLES_SYSTEM_ROLE_ADMIN,
 		})
 	}
@@ -155,7 +252,7 @@ func TestAuthentication(t *testing.T) {
 	}{{
 		desc: "good username and password",
 		user: "alice",
-		pass: "password",
+		pass: "Password1",
 	}, {
 		desc:    "good username bad password",
 		user:    "alice",
@@ -164,38 +261,74 @@ func TestAuthentication(t *testing.T) {
 	}, {
 		desc:    "bad username",
 		user:    "bob",
-		pass:    "password",
+		pass:    "Password1",
 		wantErr: true,
 	}}
 	for _, tc := range tests {
 		t.Run(tc.desc, func(t *testing.T) {
 			t.Log("Trying SSH credentials")
-			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+
+			// Try the new helper first (credz). If it fails, fall back to ssh.Dial as in the older file.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			client, err := credz.SSHWithPassword(ctx, dut, tc.user, tc.pass)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("Dialing ssh succeeded, but we expected to fail.")
+
+			// sshCloser allows closing either binding.SSHClient or *ssh.Client.
+			var sshCloser interface {
+				Close() error
+			}
+			var sshErr error
+
+			// Attempt credz helper.
+			sshClientFromCredz, err := credz.SSHWithPassword(ctx, dut, tc.user, tc.pass)
+			if err == nil && sshClientFromCredz != nil {
+				t.Logf("credz.SSHWithPassword succeeded for user %s", tc.user)
+				sshCloser = sshClientFromCredz
+			} else {
+				t.Logf("credz.SSHWithPassword returned DialSSH unimplemented for user %s: %v; This feature is not supported for all device types or simulated environments (like KNE or simulated DUTs) falling back to ssh.Dial", tc.user, err)
+				// Fallback: original ssh.Dial using sshAddr.
+				sshClientStd, err2 := ssh.Dial("tcp", sshAddr, &ssh.ClientConfig{
+					User: tc.user,
+					Auth: []ssh.AuthMethod{
+						ssh.KeyboardInteractive(keyboardInteraction(tc.pass)),
+						ssh.Password(tc.pass),
+					},
+					HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+					Timeout:         10 * time.Second,
+				})
+				if err2 == nil {
+					sshCloser = sshClientStd
 				}
-				return
+				sshErr = err2
 			}
-			if err != nil {
-				t.Fatalf("Failed dialing ssh, error: %s", err)
+
+			// If we have a client, ensure it's closed at test end.
+			if sshCloser != nil {
+				defer func() {
+					if err := sshCloser.Close(); err != nil {
+						t.Logf("error closing ssh client: %v", err)
+					}
+				}()
 			}
-			defer client.Close()
-			if tc.wantErr != (err != nil) {
+
+			// Evaluate SSH result vs expectation.
+			// If we used credz or ssh.Dial successfully, sshErr should be nil.
+			if sshCloser != nil {
+				sshErr = nil
+			}
+			if tc.wantErr != (sshErr != nil) {
 				if tc.wantErr {
-					t.Errorf("ssh.Dial got nil error, want error for user %q, password %q", tc.user, tc.pass)
+					t.Errorf("ssh expected error but got success for user %q, password %q", tc.user, tc.pass)
 				} else {
-					t.Errorf("ssh.Dial got error %v, want nil for user %q, password %q", err, tc.user, tc.pass)
+					t.Errorf("ssh got error %v, want success for user %q, password %q", sshErr, tc.user, tc.pass)
 				}
 			}
 
+			// Prepare GNMI metadata and client (same as older file).
 			ctx = metadata.AppendToOutgoingContext(
 				context.Background(),
 				"username", tc.user,
 				"password", tc.pass)
-			gnmi, err := dut.RawAPIs().BindingDUT().DialGNMI(ctx)
+			gnmi, err := gnmiClient(dut, gnmiAddr)
 			if err != nil {
 				t.Fatal(err)
 			}
