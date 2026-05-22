@@ -161,6 +161,36 @@ func createNativeUser(t testing.TB, dut *ondatra.DUTDevice, user string, pass st
 		if _, err := gnmiClient.Set(context.Background(), SetRequest); err != nil {
 			t.Fatalf("Unexpected error configuring User: %v", err)
 		}
+	case ondatra.JUNIPER:
+		cliConfig := fmt.Sprintf(`
+system {
+    login {
+        user %s {
+            class %s;
+            authentication {
+                plain-text-password-value "%s";
+            }
+        }
+    }
+}`, user, role, pass)
+		SetRequest := &gpb.SetRequest{
+			Update: []*gpb.Update{
+				{
+					Path: &gpb.Path{
+						Origin: "cli",
+					},
+					Val: &gpb.TypedValue{
+						Value: &gpb.TypedValue_AsciiVal{
+							AsciiVal: cliConfig,
+						},
+					},
+				},
+			},
+		}
+		gnmiClient := dut.RawAPIs().GNMI(t)
+		if _, err := gnmiClient.Set(context.Background(), SetRequest); err != nil {
+			t.Fatalf("Unexpected error configuring Juniper user: %v", err)
+		}
 	default:
 		t.Fatalf("Unsupported vendor %s for deviation 'deviation_native_users'", dut.Vendor())
 	}
@@ -198,12 +228,19 @@ func TestAuthentication(t *testing.T) {
 		t.Logf("No CLI config required for vendor %s", dut.Vendor())
 	}
 	if deviations.SetNativeUser(dut) {
-		createNativeUser(t, dut, "alice", "password", "admin")
+		role := "admin"
+		if dut.Vendor() == ondatra.JUNIPER {
+			role = "super-user"
+			// Wait for gNMI service to be ready after config push.
+			t.Log("Waiting for gNMI service to be ready on Juniper DUT...")
+			time.Sleep(30 * time.Second)
+		}
+		createNativeUser(t, dut, "alice", "Password1", role)
 	} else {
 		gnmi.Replace(t, dut, gnmi.OC().System().Aaa().Authentication().
 			User("alice").Config(), &oc.System_Aaa_Authentication_User{
 			Username: ygot.String("alice"),
-			Password: ygot.String("password"),
+			Password: ygot.String("Password1"),
 			Role:     oc.AaaTypes_SYSTEM_DEFINED_ROLES_SYSTEM_ROLE_ADMIN,
 		})
 	}
@@ -215,7 +252,7 @@ func TestAuthentication(t *testing.T) {
 	}{{
 		desc: "good username and password",
 		user: "alice",
-		pass: "password",
+		pass: "Password1",
 	}, {
 		desc:    "good username bad password",
 		user:    "alice",
@@ -224,7 +261,7 @@ func TestAuthentication(t *testing.T) {
 	}, {
 		desc:    "bad username",
 		user:    "bob",
-		pass:    "password",
+		pass:    "Password1",
 		wantErr: true,
 	}}
 	for _, tc := range tests {
